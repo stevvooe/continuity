@@ -4,10 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"reflect"
 	"sort"
 
 	"github.com/docker/distribution/digest"
+	"github.com/stevvooe/continuity/group"
 	pb "github.com/stevvooe/continuity/proto"
 )
 
@@ -28,6 +30,11 @@ type Resource interface {
 
 	UID() string
 	GID() string
+}
+
+type NamedOwner interface {
+	User() string
+	Group() string
 }
 
 // ByPath provides the canonical sort order for a set of resources. Use with
@@ -172,6 +179,10 @@ func Merge(fs ...Resource) (Resource, error) {
 		gid:    first.GID(),
 		xattrs: xattrs,
 	}
+	if owner, ok := first.(NamedOwner); ok {
+		canonical.resource.user = owner.User()
+		canonical.resource.group = owner.Group()
+	}
 
 	switch typedF := first.(type) {
 	case RegularFile:
@@ -238,10 +249,11 @@ type Device interface {
 }
 
 type resource struct {
-	paths    []string
-	mode     os.FileMode
-	uid, gid string
-	xattrs   map[string][]byte
+	paths       []string
+	mode        os.FileMode
+	uid, gid    string
+	user, group string
+	xattrs      map[string][]byte
 }
 
 var _ Resource = &resource{}
@@ -249,12 +261,23 @@ var _ Resource = &resource{}
 // newBaseResource returns a *resource, populated with data from p and fi,
 // where p will be populated directly.
 func newBaseResource(p string, mode os.FileMode, uid, gid string) (*resource, error) {
+	u, err := user.LookupId(uid)
+	if err != nil {
+		return nil, err
+	}
+	g, err := group.LookupId(gid)
+	if err != nil {
+		return nil, err
+	}
 	return &resource{
 		paths: []string{p},
 		mode:  mode,
 
 		uid: uid,
 		gid: gid,
+
+		user:  u.Username,
+		group: g.Groupname,
 
 		// NOTE(stevvooe): Population of shared xattrs field is deferred to
 		// the resource types that populate it. Since they are a property of
@@ -275,11 +298,29 @@ func (r *resource) Mode() os.FileMode {
 }
 
 func (r *resource) UID() string {
+	if r.user != "" {
+		if uid := lookupUser(r.user); uid != "" {
+			return uid
+		}
+	}
 	return r.uid
 }
 
 func (r *resource) GID() string {
+	if r.group != "" {
+		if gid := lookupGroup(r.group); gid != "" {
+			return gid
+		}
+	}
 	return r.gid
+}
+
+func (r *resource) User() string {
+	return r.user
+}
+
+func (r *resource) Group() string {
+	return r.group
 }
 
 type regularFile struct {
@@ -479,6 +520,11 @@ func toProto(resource Resource) *pb.Resource {
 		Mode: uint32(resource.Mode()),
 		Uid:  resource.UID(),
 		Gid:  resource.GID(),
+	}
+
+	if owner, ok := resource.(NamedOwner); ok {
+		b.User = owner.User()
+		b.Group = owner.Group()
 	}
 
 	if xattrer, ok := resource.(XAttrer); ok {
