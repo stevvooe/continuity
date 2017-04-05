@@ -205,6 +205,7 @@ const (
 	rabssymlink
 	rchardev
 	rnamedpipe
+	rwhiteout
 )
 
 type dresource struct {
@@ -217,6 +218,8 @@ type dresource struct {
 	uid          int
 	gid          int
 	major, minor int
+	xattrs       map[string][]byte
+	opaque       bool
 }
 
 func generateTestFiles(t *testing.T, root string, resources []dresource) {
@@ -236,6 +239,7 @@ func generateTestFiles(t *testing.T, root string, resources []dresource) {
 				t.Fatalf("error writing %q: %v", p, err)
 			}
 		case rdirectory:
+			// TODO: If opaque, remove directory first
 			if err := os.Mkdir(p, resource.mode); err != nil {
 				t.Fatalf("error creating directory %q: %v", p, err)
 			}
@@ -259,6 +263,8 @@ func generateTestFiles(t *testing.T, root string, resources []dresource) {
 			if err := mknod(p, resource.mode, resource.major, resource.minor); err != nil {
 				t.Fatalf("error creating device %q: %v", p, err)
 			}
+		case rwhiteout:
+			// TODO: Remove file
 		default:
 			t.Fatalf("unknown resource type: %v", resource.kind)
 		}
@@ -320,10 +326,11 @@ func expectedResourceList(root string, resources []dresource) ([]Resource, error
 		case rfile:
 			f := &regularFile{
 				resource: resource{
-					paths: []string{absPath},
-					mode:  r.mode,
-					uid:   uidStr,
-					gid:   gidStr,
+					paths:  []string{absPath},
+					mode:   r.mode,
+					uid:    uidStr,
+					gid:    gidStr,
+					xattrs: r.xattrs,
 				},
 				size:    int64(r.size),
 				digests: []digest.Digest{r.digest},
@@ -333,11 +340,13 @@ func expectedResourceList(root string, resources []dresource) ([]Resource, error
 		case rdirectory:
 			d := &directory{
 				resource: resource{
-					paths: []string{absPath},
-					mode:  r.mode,
-					uid:   uidStr,
-					gid:   gidStr,
+					paths:  []string{absPath},
+					mode:   r.mode,
+					uid:    uidStr,
+					gid:    gidStr,
+					xattrs: r.xattrs,
 				},
+				opaque: r.opaque,
 			}
 			resourceMap[absPath] = d
 			paths = append(paths, absPath)
@@ -399,6 +408,18 @@ func expectedResourceList(root string, resources []dresource) ([]Resource, error
 				},
 			}
 			resourceMap[absPath] = p
+			paths = append(paths, absPath)
+		case rwhiteout:
+			wo := &whiteout{
+				resource: resource{
+					paths:  []string{absPath},
+					mode:   r.mode,
+					uid:    uidStr,
+					gid:    gidStr,
+					xattrs: r.xattrs,
+				},
+			}
+			resourceMap[absPath] = wo
 			paths = append(paths, absPath)
 		default:
 			return nil, fmt.Errorf("unknown resource type: %v", r.kind)
