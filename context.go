@@ -2,6 +2,7 @@ package continuity
 
 import (
 	"bytes"
+	ctxu "context"
 	"fmt"
 	"io"
 	"log"
@@ -369,7 +370,7 @@ func (c *context) checkoutFile(fp string, rf RegularFile) error {
 		err error
 	)
 	for _, dgst := range rf.Digests() {
-		r, err = c.provider.Reader(dgst)
+		r, err = c.provider.Reader(ctxu.Background(), dgst)
 		if err == nil {
 			break
 		}
@@ -622,7 +623,7 @@ func (c *context) digest(p string) (digest.Digest, error) {
 	}
 	defer f.Close()
 
-	return c.digester.Digest(f)
+	return c.digester.Digest(ctxu.Background(), f)
 }
 
 // resolveXAttrs attempts to resolve the extended attributes for the resource
