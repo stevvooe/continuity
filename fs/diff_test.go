@@ -23,11 +23,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/containerd/continuity/fs/fstest"
+	"github.com/containerd/continuity/testutil"
 	"github.com/pkg/errors"
 )
 
@@ -188,6 +190,50 @@ func TestFileReplace(t *testing.T) {
 
 	if err := testDiffWithBase(l1, l2, diff); err != nil {
 		t.Fatalf("Failed diff with base: %+v", err)
+	}
+}
+
+func TestDiffDirChangeWithOverlayfs(t *testing.T) {
+	skipDiffTestOnWindows(t)
+	testutil.RequiresRoot(t)
+
+	l1 := fstest.Apply(
+		fstest.CreateDir("/dir1", 0700),
+		fstest.CreateFile("/dir1/f", []byte("/dir1/f"), 0644),
+		fstest.CreateDir("/dir1/d", 0700),
+		fstest.CreateFile("/dir1/d/f", []byte("/dir1/d/f"), 0644),
+
+		fstest.CreateDir("/dir2", 0700),
+		fstest.CreateDir("/dir2/d", 0700),
+		fstest.CreateFile("/dir2/d/f", []byte("/dir2/d/f"), 0644),
+	)
+
+	l2 := fstest.Apply(
+		fstest.CreateDir("/dir1", 0700),
+		fstest.CreateFile("/dir1/f", []byte("/dir1/f"), 0644),
+		fstest.CreateDeviceFile("/dir1/d", os.ModeDevice|os.ModeCharDevice, 0, 0),
+
+		fstest.CreateDir("/dir2", 0700),
+		fstest.CreateDir("/dir2/d", 0700),
+		fstest.CreateFile("/dir2/d/f", []byte("/dir2/d/f-diff"), 0644),
+
+		fstest.CreateDir("/dir3", 0700),
+		fstest.CreateFile("/dir3/f", []byte("/dir3/f-diff"), 0644),
+	)
+
+	diff := []TestChange{
+		Modify("/dir1"),
+		Modify("/dir1/f"),
+		Delete("/dir1/d"),
+
+		Modify("/dir2/d/f"),
+
+		Add("/dir3"),
+		Add("/dir3/f"),
+	}
+
+	if err := testDiffDirChange(l1, l2, DiffSourceOverlayFS, diff); err != nil {
+		t.Fatalf("failed diff dir change: %+v", err)
 	}
 }
 
@@ -362,7 +408,38 @@ func testDiffWithoutBase(apply fstest.Applier, expected []TestChange) error {
 	return checkChanges(tmp, changes, expected)
 }
 
+func testDiffDirChange(base, diff fstest.Applier, source DiffSource, expected []TestChange) error {
+	baseTmp, err := ioutil.TempDir("", "fast-diff-base-")
+	if err != nil {
+		return errors.Wrap(err, "failed to create temp dir")
+	}
+	defer os.RemoveAll(baseTmp)
+
+	diffTmp, err := ioutil.TempDir("", "fast-diff-diff-")
+	if err != nil {
+		return errors.Wrap(err, "failed to create temp dir")
+	}
+	defer os.RemoveAll(diffTmp)
+
+	if err := base.Apply(baseTmp); err != nil {
+		return errors.Wrap(err, "failed to apply filesytem changes")
+	}
+
+	if err := diff.Apply(diffTmp); err != nil {
+		return errors.Wrap(err, "failed to apply filesytem changes")
+	}
+
+	changes, err := collectDiffDirChanges(baseTmp, diffTmp, source)
+	if err != nil {
+		return errors.Wrap(err, "failed to collect diff dir changes")
+	}
+	return checkChanges(diffTmp, changes, expected)
+}
+
 func checkChanges(root string, changes, expected []TestChange) error {
+	sort.Sort(TestChanges(changes))
+	sort.Sort(TestChanges(expected))
+
 	if len(changes) != len(expected) {
 		return errors.Errorf("Unexpected number of changes:\n%s", diffString(changes, expected))
 	}
@@ -402,6 +479,12 @@ type TestChange struct {
 	Source   string
 }
 
+type TestChanges []TestChange
+
+func (tcs TestChanges) Len() int           { return len(tcs) }
+func (tcs TestChanges) Less(i, j int) bool { return tcs[i].Path < tcs[j].Path }
+func (tcs TestChanges) Swap(i, j int)      { tcs[i], tcs[j] = tcs[j], tcs[i] }
+
 func collectChanges(a, b string) ([]TestChange, error) {
 	changes := []TestChange{}
 	err := Changes(context.Background(), a, b, func(k ChangeKind, p string, f os.FileInfo, err error) error {
@@ -420,6 +503,26 @@ func collectChanges(a, b string) ([]TestChange, error) {
 		return nil, errors.Wrap(err, "failed to compute changes")
 	}
 
+	return changes, nil
+}
+
+func collectDiffDirChanges(baseDir, diffDir string, source DiffSource) ([]TestChange, error) {
+	changes := []TestChange{}
+	err := DiffDirChanges(context.Background(), baseDir, diffDir, source, func(k ChangeKind, p string, f os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		changes = append(changes, TestChange{
+			Kind:     k,
+			Path:     p,
+			FileInfo: f,
+			Source:   filepath.Join(diffDir, p),
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to compute changes")
+	}
 	return changes, nil
 }
 

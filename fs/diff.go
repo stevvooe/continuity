@@ -21,9 +21,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sys/unix"
 
+	"github.com/containerd/continuity/devices"
+	"github.com/containerd/continuity/sysx"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -102,9 +107,6 @@ func Changes(ctx context.Context, a, b string, changeFn ChangeFunc) error {
 	if a == "" {
 		logrus.Debugf("Using single walk diff for %s", b)
 		return addDirChanges(ctx, changeFn, b)
-	} else if diffOptions := detectDirDiff(b, a); diffOptions != nil {
-		logrus.Debugf("Using single walk diff for %s from %s", diffOptions.diffDir, a)
-		return diffDirChanges(ctx, changeFn, a, diffOptions)
 	}
 
 	logrus.Debugf("Using double walk diff for %s from %s", b, a)
@@ -134,24 +136,64 @@ func addDirChanges(ctx context.Context, changeFn ChangeFunc, root string) error 
 	})
 }
 
+// DiffChangeSource is the source of diff directory.
+type DiffSource int
+
+const (
+	// DiffSourceAUFS indicates that a diff directory is from AUFS.
+	DiffSourceAUFS DiffSource = iota
+
+	// DiffSourceOverlayFS indicates that a diff directory is from
+	// OverlayFS.
+	DiffSourceOverlayFS
+)
+
+const (
+	// whiteoutPrefix prefix means file is a whiteout. If this is followed
+	// by a filename this means that file has been removed from the base
+	// layer.
+	//
+	// See https://github.com/opencontainers/image-spec/blob/master/layer.md#whiteouts
+	whiteoutPrefix = ".wh."
+
+	// whiteoutMetaPrefix prefix means whiteout has a special meaning and
+	// is not for removing an actual file. Normally these files are
+	// excluded from exported archives.
+	whiteoutMetaPrefix = whiteoutPrefix + whiteoutPrefix
+)
+
 // diffDirOptions is used when the diff can be directly calculated from
 // a diff directory to its base, without walking both trees.
 type diffDirOptions struct {
-	diffDir      string
-	skipChange   func(string) (bool, error)
-	deleteChange func(string, string, os.FileInfo) (string, error)
+	skipChange   func(string, os.FileInfo) (bool, error)
+	deleteChange func(string, string, os.FileInfo, ChangeFunc) (bool, error)
 }
 
-// diffDirChanges walks the diff directory and compares changes against the base.
-func diffDirChanges(ctx context.Context, changeFn ChangeFunc, base string, o *diffDirOptions) error {
+// DiffDirChanges walks the diff directory and compares changes against the base.
+func DiffDirChanges(ctx context.Context, baseDir, diffDir string, source DiffSource, changeFn ChangeFunc) error {
+	var o *diffDirOptions
+
+	switch source {
+	case DiffSourceAUFS:
+		o = &diffDirOptions{
+			skipChange: skipAUFSMetadata,
+		}
+	case DiffSourceOverlayFS:
+		o = &diffDirOptions{
+			deleteChange: overlayFSWhiteoutConvert,
+		}
+	default:
+		return errors.New("unknown diff change source")
+	}
+
 	changedDirs := make(map[string]struct{})
-	return filepath.Walk(o.diffDir, func(path string, f os.FileInfo, err error) error {
+	return filepath.Walk(diffDir, func(path string, f os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
 		// Rebase path
-		path, err = filepath.Rel(o.diffDir, path)
+		path, err = filepath.Rel(diffDir, path)
 		if err != nil {
 			return err
 		}
@@ -163,38 +205,37 @@ func diffDirChanges(ctx context.Context, changeFn ChangeFunc, base string, o *di
 			return nil
 		}
 
-		// TODO: handle opaqueness, start new double walker at this
-		// location to get deletes, and skip tree in single walker
-
 		if o.skipChange != nil {
-			if skip, err := o.skipChange(path); skip {
+			if skip, err := o.skipChange(path, f); skip {
 				return err
 			}
 		}
 
 		var kind ChangeKind
 
-		deletedFile, err := o.deleteChange(o.diffDir, path, f)
-		if err != nil {
-			return err
+		deletedFile := false
+
+		if o.deleteChange != nil {
+			deletedFile, err = o.deleteChange(diffDir, path, f, changeFn)
+			if err != nil {
+				return err
+			}
 		}
 
 		// Find out what kind of modification happened
-		if deletedFile != "" {
-			path = deletedFile
+		if deletedFile {
 			kind = ChangeKindDelete
-			f = nil
 		} else {
 			// Otherwise, the file was added
 			kind = ChangeKindAdd
 
-			// ...Unless it already existed in a base, in which case, it's a modification
-			stat, err := os.Stat(filepath.Join(base, path))
+			// ...Unless it already existed in a baseDir, in which case, it's a modification
+			stat, err := os.Stat(filepath.Join(baseDir, path))
 			if err != nil && !os.IsNotExist(err) {
 				return err
 			}
 			if err == nil {
-				// The file existed in the base, so that's a modification
+				// The file existed in the baseDir, so that's a modification
 
 				// However, if it's a directory, maybe it wasn't actually modified.
 				// If you modify /foo/bar/baz, then /foo will be part of the changed files only because it's the parent of bar
@@ -217,17 +258,77 @@ func diffDirChanges(ctx context.Context, changeFn ChangeFunc, base string, o *di
 		}
 		if kind == ChangeKindAdd || kind == ChangeKindDelete {
 			parent := filepath.Dir(path)
+
 			if _, ok := changedDirs[parent]; !ok && parent != "/" {
-				pi, err := os.Stat(filepath.Join(o.diffDir, parent))
+				pi, err := os.Stat(filepath.Join(diffDir, parent))
 				if err := changeFn(ChangeKindModify, parent, pi, err); err != nil {
 					return err
 				}
 				changedDirs[parent] = struct{}{}
 			}
 		}
-
 		return changeFn(kind, path, f, nil)
 	})
+}
+
+// skipAUFSMetadata skips AUFS metadata.
+func skipAUFSMetadata(path string, f os.FileInfo) (bool, error) {
+	base := filepath.Base(path)
+
+	if !(strings.HasPrefix(base, whiteoutMetaPrefix) &&
+		len(base) > len(whiteoutMetaPrefix)) {
+
+		return false, nil
+	}
+
+	var err error = nil
+	if f.IsDir() {
+		err = filepath.SkipDir
+	}
+	return true, err
+}
+
+// overlayFSWhiteoutConvert detects whiteouts and opaque directories.
+//
+// It returns deleted indicator if the file is a character device with 0/0
+// device number. And call changeFn with ChangeKindDelete for opaque
+// directories.
+//
+// Check: https://www.kernel.org/doc/Documentation/filesystems/overlayfs.txt
+func overlayFSWhiteoutConvert(diffDir, path string, f os.FileInfo, changeFn ChangeFunc) (deleted bool, err0 error) {
+	if f.Mode()&os.ModeCharDevice != 0 {
+		if _, ok := f.Sys().(*syscall.Stat_t); !ok {
+			return false, nil
+		}
+
+		maj, min, err := devices.DeviceInfo(f)
+		if err != nil {
+			return false, err
+		}
+		return (maj == 0 && min == 0), nil
+	}
+
+	if f.IsDir() {
+		originalPath := filepath.Join(diffDir, path)
+		opaque, err := sysx.LGetxattr(originalPath, "trusted.overlay.opaque")
+		if err != nil {
+			if err == unix.ENODATA {
+				return false, nil
+			}
+			return false, errors.Wrapf(err, "failed to retrieve trusted.overlay.opaque attr")
+		}
+
+		// FIXME(fuweid): In spite of that .wh..opq might not be
+		// existing, mark it as faked delete change so that changeFn
+		// will add whiteout prefix for this faked file. It requires
+		// that changeFn callback must not read the os.FileInfo
+		// parameter.
+		if len(opaque) == 1 && opaque[0] == 'y' {
+			opaqueDirPath := filepath.Join(path, whiteoutPrefix+".opq")
+			return false, changeFn(ChangeKindDelete, opaqueDirPath, nil, nil)
+		}
+	}
+	return false, nil
 }
 
 // doubleWalkDiff walks both directories to create a diff
